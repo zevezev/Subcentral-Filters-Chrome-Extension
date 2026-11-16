@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "SubCentral Job Filter",
+  "version": "0.6.0",
+  "description": "Search, filters, sorting, bike/transit commute times and a \"search finished\" notification for the SubCentral Available Jobs list.",
+  "permissions": [
+    "storage",
+    "notifications"
+  ],
+  "host_permissions": [
+    "https://places.googleapis.com/*",
+    "https://routes.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://subcentral.sfe.powerschool.com/substituteAvailableJob*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
