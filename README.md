@@ -89,3 +89,5 @@ node dev/preview-server.js "/path/to/Available Jobs _  SmartFind Express _ Power
 ```
 
 Open http://localhost:8765. The page runs the real `background.js` and `content.js`, with Chrome's extension features swapped for in-page stand-ins (`dev/chrome-shim.js`). Reload the page to pick up edits.
+
+To build the Chrome Web Store upload, bump `version` in `manifest.json` (and the version in the User-Agent in `background.js` and `transitous_rules.json`), then run `sh dev/build-zip.sh`. Store listing text and images are in `store/`.

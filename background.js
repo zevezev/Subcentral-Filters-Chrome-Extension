@@ -89,7 +89,7 @@ function nextWeekdayArrival(hhmm, now = new Date()) {
 // ---------- Transitous calls ----------
 // Transitous requires a User-Agent naming the app and a contact. Chrome may drop this header from fetch,
 // so transitous_rules.json also sets it with declarativeNetRequest; keep the two in sync.
-const TRANSITOUS_UA = 'SubCentralJobFilter/0.7 (+https://github.com/zevezev/Subcentral-Filters-Chrome-Extension)';
+const TRANSITOUS_UA = 'SubCentralJobFilter/1.0 (+https://github.com/zevezev/Subcentral-Filters-Chrome-Extension)';
 
 // Returns null for requests Transitous can't answer (e.g. no street near a point); throws for anything else.
 async function transitousGet(path, params, retries = 1) {
