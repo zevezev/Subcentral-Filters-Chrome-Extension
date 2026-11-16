@@ -1,15 +1,25 @@
 {
   "manifest_version": 3,
   "name": "SubCentral Job Filter",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Search, filters, sorting, bike/transit commute times and a \"search finished\" notification for the SubCentral Available Jobs list.",
   "permissions": [
     "storage",
-    "notifications"
+    "notifications",
+    "declarativeNetRequestWithHostAccess"
   ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "transitous_user_agent",
+        "enabled": true,
+        "path": "transitous_rules.json"
+      }
+    ]
+  },
   "host_permissions": [
-    "https://places.googleapis.com/*",
-    "https://routes.googleapis.com/*"
+    "https://photon.komoot.io/*",
+    "https://api.transitous.org/*"
   ],
   "background": {
     "service_worker": "background.js"

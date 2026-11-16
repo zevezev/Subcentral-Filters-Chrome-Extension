@@ -1,12 +1,16 @@
 // Commute lookups for the SubCentral Job Filter.
-// Runs in the extension's service worker, so the Google API key stays out of the SubCentral page.
+// Schools are found with Photon (OpenStreetMap); home address, bike and transit times come from Transitous.
 'use strict';
 
-const PLACES_URL = 'https://places.googleapis.com/v1/places:searchText';
-const ROUTES_URL = 'https://routes.googleapis.com/directions/v2:computeRoutes';
-const NYC_RECT = { low: { latitude: 40.477398, longitude: -74.259087 }, high: { latitude: 40.91618, longitude: -73.70018 } };
+const PHOTON_URL = 'https://photon.komoot.io/api/';
+const TRANSITOUS_URL = 'https://api.transitous.org/api';
+const NYC_BBOX = '-74.259087,40.477398,-73.70018,40.91618'; // minLon,minLat,maxLon,maxLat
+const NYC_CENTER = '40.71,-73.99';
 const SAME_CAMPUS_M = 300; // results this close together count as one location
-const settings = { retryDelayMs: 800 };
+const MAX_HOME_KM = 80;
+const MISS_RETRY_MS = 7 * 24 * 3600e3;
+const MAX_BIKE_S = 7200; // Transitous drops direct trips longer than this (its default is only 30 minutes)
+const settings = { retryDelayMs: 800, photonTimeoutMs: 10000, transitousTimeoutMs: 20000 };
 
 // ---------- storage ----------
 const store = {
@@ -16,41 +20,18 @@ const store = {
 let cache = null, cacheLoading = null;
 function loadCache() {
   // one shared load, so parallel lookups on a cold start all write into the same cache object
-  if (!cacheLoading) cacheLoading = store.get('commuteCache').then(v => (cache = v || { places: {}, routes: {} }));
+  if (!cacheLoading) cacheLoading = store.get('commuteCache').then(v => {
+    cache = v || {};
+    if (cache.version !== 2) cache = { version: 2 }; // older versions cached Google results
+    cache.photon = cache.photon || {};
+    cache.homes = cache.homes || {};
+    cache.routes = cache.routes || {};
+    return cache;
+  });
   return cacheLoading;
 }
 const persistCache = () => store.set('commuteCache', cache);
-const getCfg = async () => (await store.get('commuteCfg')) || { home: '', key: '' };
-
-// ---------- monthly usage limits ----------
-// Defaults sit a little under Google's free monthly allowances (Text Search Pro: 5,000; Compute Routes Essentials: 10,000).
-// Counts every request this extension sends (retries included) and refuses to send more once a limit is hit.
-const DEFAULT_LIMITS = { places: 4500, routes: 9000 };
-let usage = null, usageLoading = null;
-function monthKey(d = new Date()) { // Google Cloud bills by calendar month in Pacific time
-  const o = {};
-  new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit' }).formatToParts(d).forEach(p => { o[p.type] = p.value; });
-  return `${o.year}-${o.month}`;
-}
-async function loadUsage() {
-  if (!usageLoading) usageLoading = store.get('commuteUsage').then(v => { usage = v || {}; });
-  await usageLoading;
-  const mk = monthKey();
-  if (usage.month !== mk) { usage.month = mk; usage.places = 0; usage.routes = 0; } // new month, fresh count
-  usage.places = usage.places || 0; usage.routes = usage.routes || 0;
-  return usage;
-}
-const limitsOf = cfg => ({ ...DEFAULT_LIMITS, ...((cfg && cfg.limits) || {}) });
-async function reserve(kind) {
-  await loadUsage();
-  const limit = limitsOf(await getCfg())[kind];
-  // no awaits between the check and the increment, so parallel lookups can't slip past the limit
-  if (usage[kind] >= limit) {
-    throw Object.assign(new Error(`Monthly limit reached (${limit.toLocaleString('en-US')} Google ${kind === 'places' ? 'searches' : 'route lookups'}). Saved results still show; raise the limit in Commute settings to look up more.`), { limit: true });
-  }
-  usage[kind]++;
-  await store.set('commuteUsage', usage);
-}
+const getCfg = async () => (await store.get('commuteCfg')) || { home: '' };
 
 // ---------- helpers ----------
 function distM(a, b) {
@@ -61,7 +42,7 @@ function distM(a, b) {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-// Which borough a Google-formatted address is in, from its ZIP code (or the borough name).
+// Which borough an address is in, from its ZIP code (or the borough name).
 function boroughFromAddress(addr) {
   const a = addr || '';
   const m = /\b(\d{5})\b/.exec(a);
@@ -105,75 +86,143 @@ function nextWeekdayArrival(hhmm, now = new Date()) {
   return new Date(now.getTime() + 24 * 3600e3).toISOString().replace('.000Z', 'Z');
 }
 
-// ---------- Google calls ----------
-async function googleFetch(label, kind, url, key, mask, body, retries = 1) {
-  await reserve(kind);
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': key, 'X-Goog-FieldMask': mask },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    if ((res.status === 429 || res.status === 503) && retries > 0) {
-      await new Promise(r => setTimeout(r, settings.retryDelayMs));
-      return googleFetch(label, kind, url, key, mask, body, retries - 1);
-    }
-    let msg = res.statusText || 'request failed';
-    try { const j = await res.json(); if (j && j.error && j.error.message) msg = j.error.message; } catch (e) { /* ignore */ }
-    throw Object.assign(new Error(`Google ${label} error (${res.status}): ${msg}`), { status: res.status });
+// ---------- Transitous calls ----------
+// Transitous requires a User-Agent naming the app and a contact. Chrome may drop this header from fetch,
+// so transitous_rules.json also sets it with declarativeNetRequest; keep the two in sync.
+const TRANSITOUS_UA = 'SubCentralJobFilter/0.7 (+https://github.com/zevezev/Subcentral-Filters-Chrome-Extension)';
+
+// Returns null for requests Transitous can't answer (e.g. no street near a point); throws for anything else.
+async function transitousGet(path, params, retries = 1) {
+  const url = TRANSITOUS_URL + path + '?' + new URLSearchParams(params);
+  let res;
+  try {
+    res = await fetch(url, { headers: { 'User-Agent': TRANSITOUS_UA }, signal: AbortSignal.timeout(settings.transitousTimeoutMs) });
+  } catch (e) {
+    if (retries > 0) return transitousGet(path, params, retries - 1);
+    throw new Error(e.name === 'TimeoutError' ? 'Transitous timed out' : `Transitous unreachable: ${e.message}`);
   }
-  return res.json();
+  if (res.ok) return res.json();
+  if ((res.status === 429 || res.status >= 500) && retries > 0) {
+    await new Promise(r => setTimeout(r, settings.retryDelayMs));
+    return transitousGet(path, params, retries - 1);
+  }
+  if ([400, 404, 422].includes(res.status)) return null;
+  let detail = '';
+  try { detail = (await res.text()).slice(0, 160); } catch (e) { /* ignore */ }
+  throw new Error(`Transitous error (${res.status})${detail ? ': ' + detail : ''}`);
+}
+
+const LATLNG = /^\s*(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$/;
+// Home address -> coordinates. Typing "lat,lng" skips the lookup.
+async function resolveHome(home) {
+  const m = LATLNG.exec(home);
+  if (m) return { lat: +m[1], lng: +m[2], label: `${m[1]},${m[2]}` };
+  const c = await loadCache();
+  const ck = home.toLowerCase();
+  if (c.homes[ck]) return c.homes[ck];
+  const rows = await transitousGet('/v1/geocode', { text: home, type: 'ADDRESS,PLACE', numResults: '1', place: NYC_CENTER });
+  const r = rows && rows[0];
+  const [cLat, cLng] = NYC_CENTER.split(',').map(Number);
+  // the geocoder always returns its best guess somewhere in the world, so anything far from NYC counts as not found
+  if (!r || distM({ lat: r.lat, lng: r.lon }, { lat: cLat, lng: cLng }) > MAX_HOME_KM * 1000) return null;
+  const area = (r.areas || []).map(a => a.name).filter(Boolean).pop();
+  const out = { lat: r.lat, lng: r.lon, label: [r.name, area].filter(Boolean).join(', ') };
+  c.homes[ck] = out;
+  await persistCache();
+  return out;
 }
 
 const inflight = new Map();
 const once = (k, fn) => { if (!inflight.has(k)) inflight.set(k, fn().finally(() => inflight.delete(k))); return inflight.get(k); };
 
-// Find the school on Google Maps. "?" cases: no result, or several different locations.
-function resolvePlace(query, borough, key) {
+async function photonSearch(query, retries = 1) {
+  const url = PHOTON_URL + '?' + new URLSearchParams({ q: query, bbox: NYC_BBOX, limit: '10', lang: 'en' });
+  let res;
+  try {
+    res = await fetch(url, { signal: AbortSignal.timeout(settings.photonTimeoutMs) });
+  } catch (e) {
+    if (retries > 0) return photonSearch(query, retries - 1);
+    throw new Error(e.name === 'TimeoutError' ? 'Photon map search timed out' : `Photon map search failed: ${e.message}`);
+  }
+  if (!res.ok) {
+    if ((res.status === 429 || res.status >= 500) && retries > 0) {
+      await new Promise(r => setTimeout(r, settings.retryDelayMs));
+      return photonSearch(query, retries - 1);
+    }
+    throw Object.assign(new Error(`Photon map search error (${res.status}): ${res.statusText || 'request failed'}`), { status: res.status });
+  }
+  return res.json();
+}
+
+function photonPlace(f) {
+  const p = f.properties || {};
+  const [lng, lat] = (f.geometry && f.geometry.coordinates) || [];
+  const street = [p.housenumber, p.street].filter(Boolean).join(' ');
+  return {
+    id: `osm:${p.osm_type}${p.osm_id}`, name: p.name || street || 'School',
+    address: [street, p.district || p.city, p.postcode].filter(Boolean).join(', '),
+    lat, lng,
+  };
+}
+
+// Find the school on OpenStreetMap (via Photon). "?" cases: no result, or several different locations.
+function resolvePlace(query, borough) {
   return once('p|' + query, async () => {
     const c = await loadCache();
     const ck = query.toLowerCase();
-    if (c.places[ck]) return c.places[ck];
-    const data = await googleFetch('Places', 'places', PLACES_URL, key, 'places.id,places.displayName,places.formattedAddress,places.location', {
-      textQuery: query, includedType: 'school', strictTypeFiltering: true, pageSize: 5,
-      languageCode: 'en', regionCode: 'US', locationRestriction: { rectangle: NYC_RECT },
-    });
-    let places = (data.places || []).map(p => ({
-      id: p.id, name: p.displayName && p.displayName.text, address: p.formattedAddress,
-      lat: p.location && p.location.latitude, lng: p.location && p.location.longitude,
-    }));
+    const hit = c.photon[ck];
+    // a school that couldn't be matched is looked up again after a while, in case the map data improved
+    if (hit && (hit.status === 'ok' || Date.now() - (hit.at || 0) < MISS_RETRY_MS)) return hit;
+    let data;
+    try {
+      data = await photonSearch(query);
+    } catch (e) { // not cached, so the next search tries this school again
+      return { status: 'none', reason: `${e.message}; search again to retry` };
+    }
+    let places = (data.features || [])
+      .filter(f => f.properties && f.properties.osm_value === 'school')
+      .map(photonPlace)
+      .filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lng));
+    // Photon also returns loosely related schools, so when the query has a school number, keep only that number.
+    const num = (/\b(?:P\.?S|I\.?S|J\.?H\.?S|M\.?S|H\.?S)\.?\s*(\d{1,3})\b/i.exec(query) || [])[1];
+    if (num) places = places.filter(p => new RegExp(`(?<!\\d)${num}(?!\\d)`).test(p.name));
+    else places = places.slice(0, 1); // no number to check, so trust Photon's top-ranked school
     let result;
     if (!places.length) {
-      result = { status: 'none', reason: 'No match on Google Maps' };
+      result = { status: 'none', reason: 'No school match on the map' };
     } else {
       const inBoro = borough ? places.filter(p => boroughFromAddress(p.address) === borough) : [];
       if (inBoro.length) places = inBoro; // drop same-named schools in other boroughs
       const first = places[0];
       const spread = Math.max(0, ...places.slice(1).map(p => distM(first, p)));
       if (places.length > 1 && spread > SAME_CAMPUS_M) {
-        result = { status: 'multiple', reason: `${places.length} different locations on Google Maps (${places.slice(0, 3).map(p => p.name).join('; ')})` };
+        result = { status: 'multiple', reason: `${places.length} different locations on the map (${places.slice(0, 3).map(p => p.name).join('; ')})` };
       } else {
         result = { status: 'ok', place: first };
       }
     }
-    c.places[ck] = result;
+    if (result.status !== 'ok') result.at = Date.now();
+    c.photon[ck] = result;
     await persistCache();
     return result;
   });
 }
 
-function route(home, place, mode, hhmm, key) {
-  const rk = [home.toLowerCase(), place.id, mode, mode === 'TRANSIT' ? hhmm : ''].join('|');
+// Bike: the direct bike trip. Transit: the quickest trip arriving by the job start on the next weekday.
+function route(home, place, mode, hhmm) {
+  const from = `${home.lat},${home.lng}`, to = `${place.lat},${place.lng}`;
+  const rk = [from, to, mode, mode === 'TRANSIT' ? hhmm : ''].join('|');
   return once('r|' + rk, async () => {
     const c = await loadCache();
     if (rk in c.routes) return c.routes[rk];
-    const body = { origin: { address: home }, destination: { placeId: place.id }, travelMode: mode };
-    if (mode === 'TRANSIT') body.arrivalTime = nextWeekdayArrival(hhmm);
-    const data = await googleFetch('Routes', 'routes', ROUTES_URL, key, 'routes.duration,routes.distanceMeters', body);
-    const r = data.routes && data.routes[0];
-    const out = r && r.duration
-      ? { min: Math.max(1, Math.round(parseFloat(r.duration) / 60)), mi: Math.round(((r.distanceMeters || 0) / 1609.344) * 10) / 10 }
-      : null; // Google found no route
+    // separate requests per mode, so a fast bike trip can't cut transit trips out of the results
+    const params = mode === 'BIKE'
+      ? { fromPlace: from, toPlace: to, transitModes: '', directModes: 'BIKE', maxDirectTime: String(MAX_BIKE_S) }
+      : { fromPlace: from, toPlace: to, directModes: '', arriveBy: 'true', time: nextWeekdayArrival(hhmm) };
+    const data = await transitousGet('/v6/plan', params);
+    const trips = data ? (mode === 'BIKE' ? data.direct : data.itineraries) || [] : [];
+    const best = Math.min(...trips.map(t => t.duration).filter(Number.isFinite));
+    const out = Number.isFinite(best) ? { min: Math.max(1, Math.round(best / 60)) } : null; // no route found
     c.routes[rk] = out;
     await persistCache();
     return out;
@@ -184,42 +233,34 @@ function route(home, place, mode, hhmm, key) {
 async function handle(msg, sender) {
   if (msg.type === 'getConfig') {
     const cfg = await getCfg();
-    return { home: cfg.home || '', hasKey: !!cfg.key, limits: limitsOf(cfg) }; // never hands the key back
-  }
-  if (msg.type === 'getUsage') {
-    await loadUsage();
-    return { month: usage.month, places: usage.places, routes: usage.routes, limits: limitsOf(await getCfg()) };
+    return { home: cfg.home || '' };
   }
   if (msg.type === 'setConfig') {
-    const cfg = await getCfg();
-    if (typeof msg.home === 'string') cfg.home = msg.home.trim();
-    if (typeof msg.key === 'string' && msg.key.trim()) cfg.key = msg.key.trim();
-    if (msg.limits) {
-      cfg.limits = cfg.limits || {};
-      ['places', 'routes'].forEach(k => { const n = msg.limits[k]; if (Number.isInteger(n) && n >= 0 && n <= 1e6) cfg.limits[k] = n; });
-    }
+    const cfg = { home: typeof msg.home === 'string' ? msg.home.trim() : '' };
     await store.set('commuteCfg', cfg);
-    return { home: cfg.home || '', hasKey: !!cfg.key, limits: limitsOf(cfg) };
-  }
-  if (msg.type === 'clearCache') {
-    cache = { places: {}, routes: {} };
-    cacheLoading = Promise.resolve(cache);
-    await persistCache();
-    return { ok: true };
+    if (!cfg.home) return { home: '' };
+    try {
+      const h = await resolveHome(cfg.home);
+      return h ? { home: cfg.home, homeLabel: h.label } : { home: cfg.home, error: 'Saved, but that address wasn’t found on the map. Try adding the ZIP code, or paste "lat,lng".' };
+    } catch (e) {
+      return { home: cfg.home, error: `Saved, but the address couldn’t be checked: ${e.message}` };
+    }
   }
   if (msg.type === 'commute') {
     const cfg = await getCfg();
-    if (!cfg.home || !cfg.key) return { error: 'Add your home address and Google Maps API key under Commute settings' };
+    if (!cfg.home) return { error: 'Add your home address under Commute settings' };
     try {
-      const place = await resolvePlace(msg.query, msg.borough, cfg.key);
+      const home = await resolveHome(cfg.home);
+      if (!home) return { error: 'Your home address wasn’t found on the map. Edit it under Commute settings (adding the ZIP code helps).' };
+      const place = await resolvePlace(msg.query, msg.borough);
       if (place.status !== 'ok') return { status: place.status, reason: place.reason };
       const [bike, transit] = await Promise.all([
-        route(cfg.home, place.place, 'BICYCLE', msg.hhmm, cfg.key),
-        route(cfg.home, place.place, 'TRANSIT', msg.hhmm, cfg.key),
+        route(home, place.place, 'BIKE', msg.hhmm),
+        route(home, place.place, 'TRANSIT', msg.hhmm),
       ]);
       return { status: 'ok', place: { name: place.place.name, address: place.place.address }, bike, transit };
     } catch (e) {
-      return { error: e.message, limit: !!e.limit };
+      return { error: e.message };
     }
   }
   if (msg.type === 'notifyReady') {
@@ -264,4 +305,4 @@ if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage)
 if (typeof chrome !== 'undefined' && chrome.notifications && chrome.notifications.onClicked) {
   chrome.notifications.onClicked.addListener(onNotificationClicked);
 }
-if (typeof module !== 'undefined') module.exports = { handle, onNotificationClicked, nextWeekdayArrival, boroughFromAddress, settings, _reset: () => { cache = null; cacheLoading = null; usage = null; usageLoading = null; inflight.clear(); } };
+if (typeof module !== 'undefined') module.exports = { handle, onNotificationClicked, nextWeekdayArrival, boroughFromAddress, settings, _reset: () => { cache = null; cacheLoading = null; inflight.clear(); } };
