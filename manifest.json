@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SubCentral Job Filter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Filters, sorting, bike and transit times, and a \"search finished\" alert for the SubCentral Available Jobs page.",
   "permissions": [
     "storage",
@@ -25,6 +25,16 @@
     "service_worker": "background.js"
   },
   "content_scripts": [
+    {
+      "matches": [
+        "https://subcentral.sfe.powerschool.com/substituteAvailableJob*Div.do*",
+        "https://subcentral.sfe.powerschool.com/homeAction.do*"
+      ],
+      "js": [
+        "fullsite.js"
+      ],
+      "run_at": "document_start"
+    },
     {
       "matches": [
         "https://subcentral.sfe.powerschool.com/substituteAvailableJob*"

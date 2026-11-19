@@ -27,7 +27,7 @@ Nothing else is sent anywhere: not your name, your SubCentral login, or the job 
 
 ## What it reads
 
-The extension only runs on the SubCentral Available Jobs pages (`https://subcentral.sfe.powerschool.com/substituteAvailableJob*`). It reads the job list on that page in your browser to filter and sort it.
+The extension only runs on the SubCentral Available Jobs pages (`https://subcentral.sfe.powerschool.com/substituteAvailableJob*`). It reads the job list on that page in your browser to filter and sort it. If SubCentral opens its mobile version (on a narrow window), the extension switches to the full site, which passes briefly through the SubCentral Home page (`homeAction.do`). Nothing is read there.
 
 ## Contact
 
